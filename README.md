@@ -31,7 +31,7 @@ Follow these steps to set up the project on your local machine using a Python vi
 ### 1. Clone & Prepare Directory
 Make sure you are in the project root directory:
 ```bash
-cd D:\Backend_Django_Engineer_Assessment
+cd [path_to_project] \ Backend_Django_Engineer_Assessment
 ```
 
 ### 2. Create Virtual Environment

@@ -59,7 +59,6 @@ class CacheService:
         """
         key = cls._make_safe_key("route", start, finish)
         cache.set(key, route_data, ROUTE_CACHE_TTL)
-        logger.info(f"Cached route successfully for key: {key}")
 
     @classmethod
     def get_geocode(cls, query: str) -> Optional[List[float]]:
