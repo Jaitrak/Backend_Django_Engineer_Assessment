@@ -1,7 +1,8 @@
 import math
+import time
 import logging
 from typing import List, Dict, Any, Tuple
-from django.db.models import Avg
+from django.db.models import Avg, Q
 from fuel.models import TruckStop
 from fuel.constants import MAX_RANGE_MILES, MPG, SEARCH_RADIUS_MILES
 from fuel.exceptions import FuelOptimizationError
@@ -50,6 +51,7 @@ class FuelOptimizerService:
             - fuel_stops: List of Dicts representing selected truck stops
             - total_fuel_cost: float
         """
+        t_start = time.perf_counter()
         if not route_coordinates:
             raise FuelOptimizationError("No route coordinates provided.")
 
@@ -79,22 +81,30 @@ class FuelOptimizerService:
             }
 
         # 2. Extract bounding box of the route with 0.5 degrees margin (approx 35 miles)
-        lons = [pt[0] for pt in route_coordinates]
-        lats = [pt[1] for pt in route_coordinates]
+        # Using 15 segmented bounding boxes to avoid fetching candidate stops far from the actual route
+        segment_count = 15
+        segment_size = max(1, len(route_coordinates) // segment_count)
+        margin_lat = 0.73
+        margin_lon = 1.0
 
-        min_lon, max_lon = min(lons) - 0.5, max(lons) + 0.5
-        min_lat, max_lat = min(lats) - 0.5, max(lats) + 0.5
+        q_objects = Q()
+        for i in range(0, len(route_coordinates), segment_size):
+            segment = route_coordinates[i : i + segment_size + 1]
+            lons_seg = [pt[0] for pt in segment]
+            lats_seg = [pt[1] for pt in segment]
+            min_lon_seg, max_lon_seg = min(lons_seg) - margin_lon, max(lons_seg) + margin_lon
+            min_lat_seg, max_lat_seg = min(lats_seg) - margin_lat, max(lats_seg) + margin_lat
+            
+            q_objects |= Q(
+                latitude__gte=min_lat_seg,
+                latitude__lte=max_lat_seg,
+                longitude__gte=min_lon_seg,
+                longitude__lte=max_lon_seg,
+            )
 
-        # 3. Query candidates within the bounding box
-        db_candidates = TruckStop.objects.filter(
-            latitude__gte=min_lat,
-            latitude__lte=max_lat,
-            longitude__gte=min_lon,
-            longitude__lte=max_lon,
-        )
-        logger.info(
-            f"Filtered database to {db_candidates.count()} candidate stops within route bounding box."
-        )
+        # 3. Query candidates within the segmented bounding box
+        db_candidates = list(TruckStop.objects.filter(q_objects))
+        db_candidates_count = len(db_candidates)
 
         # 4. Calculate cumulative distance along route coordinates to map indices to distances
         cumulative_distances = [0.0]
@@ -105,17 +115,34 @@ class FuelOptimizerService:
             )
             cumulative_distances.append(cumulative_distances[-1] + segment_dist)
 
-        # 5. Project candidates onto the route (find closest route point and verify within threshold)
+        # 5. Project candidates onto the route (Coarse-to-fine spatial search)
+        t_proj_start = time.perf_counter()
         projected_candidates = []
+        R = len(route_coordinates)
+        K = int(math.sqrt(R)) if R > 50 else 1
+
         for stop in db_candidates:
             stop_coord = (stop.longitude, stop.latitude)
 
-            # Find the closest point index on the route
+            # Stage 1: Coarse search
+            min_dist_coarse = float("inf")
+            best_coarse_idx = 0
+            for idx in range(0, R, K):
+                pt = route_coordinates[idx]
+                dist = cls._haversine(stop_coord, (pt[0], pt[1]))
+                if dist < min_dist_coarse:
+                    min_dist_coarse = dist
+                    best_coarse_idx = idx
+
+            # Stage 2: Fine search around the neighborhood of best_coarse_idx
+            start_idx = max(0, best_coarse_idx - K)
+            end_idx = min(R, best_coarse_idx + K + 1)
+
             min_dist = float("inf")
             best_idx = 0
-            for idx, pt in enumerate(route_coordinates):
-                pt_coord = (pt[0], pt[1])
-                dist = cls._haversine(stop_coord, pt_coord)
+            for idx in range(start_idx, end_idx):
+                pt = route_coordinates[idx]
+                dist = cls._haversine(stop_coord, (pt[0], pt[1]))
                 if dist < min_dist:
                     min_dist = dist
                     best_idx = idx
@@ -131,9 +158,7 @@ class FuelOptimizerService:
                     }
                 )
 
-        logger.info(
-            f"Found {len(projected_candidates)} candidate stops within {SEARCH_RADIUS_MILES} miles of route."
-        )
+        projection_time = time.perf_counter() - t_proj_start
 
         # Sort candidate stops by their projected distance along the route
         projected_candidates.sort(key=lambda x: x["projected_dist"])
@@ -240,6 +265,13 @@ class FuelOptimizerService:
                     "longitude": model.longitude,
                 }
             )
+
+        optimizer_total = time.perf_counter() - t_start
+        logger.info(f"Route points: {R}")
+        logger.info(f"DB candidates: {db_candidates_count}")
+        logger.info(f"Filtered candidates: {len(projected_candidates)}")
+        logger.info(f"Projection: {projection_time:.2f}s")
+        logger.info(f"Optimizer total: {optimizer_total:.2f}s")
 
         return {
             "fuel_stops": stops_response,
